@@ -1,6 +1,8 @@
 import { useEffect, useState } from 'react';
 import axios from 'axios';
-import { CheckCircle2, AlertTriangle, XCircle, Search, Edit2 } from 'lucide-react';
+import { CheckCircle2, AlertTriangle, XCircle, Search, Edit2, Download } from 'lucide-react';
+import jsPDF from 'jspdf';
+import autoTable from 'jspdf-autotable';
 
 interface Field {
   id: string;
@@ -50,6 +52,42 @@ export default function ExtractionResults({ documentId, onFieldSelect }: Props) 
     } catch (e) {
       console.error(e);
     }
+  };
+
+  const downloadPDF = () => {
+    const doc = new jsPDF();
+    
+    doc.setFontSize(18);
+    doc.text('Parsed Invoice Extraction Report', 14, 22);
+    
+    doc.setFontSize(11);
+    doc.setTextColor(100);
+    doc.text(`Document ID: ${documentId}`, 14, 30);
+    doc.text(`Generated on: ${new Date().toLocaleString()}`, 14, 36);
+
+    const validFields = fields.filter(f => f.field_name !== "Extraction Failure" && f.field_name !== "Reconciliation Error");
+    
+    const tableData = validFields.map(f => [
+      f.field_name,
+      f.value_text,
+      (f.confidence_score * 100).toFixed(0) + '%'
+    ]);
+
+    autoTable(doc, {
+      startY: 45,
+      head: [['Metadata Category', 'Extracted Value', 'Confidence']],
+      body: tableData,
+      theme: 'grid',
+      headStyles: { fillColor: [41, 128, 185] },
+      styles: { fontSize: 10, cellPadding: 4 },
+      columnStyles: {
+        0: { fontStyle: 'bold', cellWidth: 40 },
+        1: { cellWidth: 110 },
+        2: { cellWidth: 30, halign: 'center' }
+      }
+    });
+
+    doc.save(`invoice_report_${documentId.substring(0, 8)}.pdf`);
   };
 
   return (
@@ -193,8 +231,14 @@ export default function ExtractionResults({ documentId, onFieldSelect }: Props) 
       {/* Structured Parsing Table (Hackathon Request) */}
       {fields.length > 0 && fields.some(f => f.field_name !== "Extraction Failure" && f.field_name !== "Reconciliation Error") && (
       <div className="glass-panel rounded-xl overflow-hidden">
-        <div className="p-4 border-b border-white/10 bg-white/5">
+        <div className="p-4 border-b border-white/10 bg-white/5 flex justify-between items-center">
           <h3 className="font-semibold text-lg text-primary">Parsed Schema Data</h3>
+          <button 
+            onClick={downloadPDF}
+            className="flex items-center gap-2 bg-primary/20 hover:bg-primary/40 text-primary-foreground px-4 py-1.5 rounded-lg text-sm font-medium transition-colors"
+          >
+            <Download className="w-4 h-4" /> Download PDF Report
+          </button>
         </div>
         <div className="p-0 overflow-x-auto">
           <table className="w-full text-sm text-left">
