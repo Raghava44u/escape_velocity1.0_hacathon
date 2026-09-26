@@ -114,39 +114,37 @@ async def process_document_pipeline(document_id: str, file_path: str, file_type:
                             text_lower = text.lower()
                             extracted = []
                             
-                            if "invoice" in text_lower:
-                                match = re.search(r'(?i)invoice\s*(?:no|#|number|id)?\s*[:\-]*\s*([a-z0-9\-]+)', text)
-                                if match: extracted.append(("Invoice ID", match.group(1).strip()))
+                            # 1. Invoice ID (Look for 6+ digit numbers)
+                            if not extracted:
+                                nums = re.findall(r'\b\d{6,8}\b', text)
+                                # If it's near the top of the page, it's likely the Invoice ID
+                                if nums and y_norm < 300:
+                                    extracted.append(("Invoice ID", nums[0]))
                             
-                            if "date" in text_lower:
-                                match = re.search(r'(?i)date\s*(?:of\s*issue)?\s*[:\-]*\s*([\d\/\-\.]+)', text)
-                                if match: extracted.append(("Invoice Date", match.group(1).strip()))
+                            # 2. Date (Look for DD.MM.YYYY or MM/DD/YYYY)
+                            if not extracted:
+                                dates = re.findall(r'\b\d{2}[\./-]\d{2}[\./-]\d{4}\b', text)
+                                if dates: extracted.append(("Invoice Date", dates[0]))
                                 
-                            if "tax id" in text_lower or "taxid" in text_lower:
-                                matches = re.findall(r'(?i)tax\s*id\s*[:\-]*\s*([\d\-]+)', text)
-                                for match in matches:
-                                    extracted.append(("Tax ID", match.strip()))
-                                    
-                            if "iban" in text_lower:
-                                match = re.search(r'(?i)iban\s*[:\-]*\s*([a-z0-9]+)', text)
-                                if match: extracted.append(("IBAN", match.group(1).strip().upper()))
+                            # 3. Tax ID / VAT
+                            if "tax id" in text_lower or "taxid" in text_lower or "vat number" in text_lower:
+                                matches = re.findall(r'(?i)(?:tax\s*id|vat\s*number)\s*[:\-]*\s*([a-z0-9\-]+)', text)
+                                for match in matches: extracted.append(("Tax ID", match.strip()))
                             
-                            if "subtotal" in text_lower or "sub-total" in text_lower:
-                                match = re.search(r'(?i)subtotal.*?([\d,\.]+)', text)
-                                if not match: match = re.search(r'[\d,\.]+', text)
-                                if match: extracted.append(("Subtotal", match.group(1) if len(match.groups()) > 0 else match.group(0)))
+                            # 4. Totals (Look for rows with multiple money-like numbers near the bottom)
+                            if not extracted and y_norm > 700:
+                                amounts = re.findall(r'[\$£€]?\s*(\d{2,}[,\.]\d{2})\b', text)
+                                if amounts and len(amounts) >= 3:
+                                    extracted.append(("Subtotal", amounts[0]))
+                                    extracted.append(("VAT Amount", amounts[1]))
+                                    extracted.append(("Total Amount", amounts[-1]))
+                                elif amounts and len(amounts) == 1 and ("total" in text_lower or "due" in text_lower):
+                                    extracted.append(("Total Amount", amounts[0]))
                             
-                            if "total" in text_lower and "sub" not in text_lower:
-                                # We can also capture the multiple totals in the summary row
-                                match = re.findall(r'\$\s*([\d\s,\.]+)', text)
-                                if match and len(match) >= 3:
-                                    extracted.append(("Net Worth", match[0].strip()))
-                                    extracted.append(("VAT Amount", match[1].strip()))
-                                    extracted.append(("Total Amount", match[2].strip()))
-                                else:
-                                    match = re.search(r'(?i)total.*?([\d,\.]+)', text)
-                                    if not match: match = re.search(r'[\d,\.]+', text)
-                                    if match: extracted.append(("Total Amount", match.group(1) if len(match.groups()) > 0 else match.group(0)))
+                            # 5. Fallback for subtotal alone
+                            if not extracted and ("subtotal" in text_lower or "sub-total" in text_lower):
+                                match = re.search(r'[\d,\.]+', text)
+                                if match: extracted.append(("Subtotal", match.group(0)))
                             
                             # Address / Name heuristic (Top of page, no numbers except zip codes / street numbers)
                             if y_norm < 280 and not ("invoice" in text_lower or "date" in text_lower or "tax" in text_lower or "iban" in text_lower):
@@ -156,31 +154,54 @@ async def process_document_pipeline(document_id: str, file_path: str, file_type:
                                 elif len(text.strip()) > 3:
                                     extracted.append(("Entity Info", text.strip()))
                                 
-                            # Specific Line Item parsing requested by user
-                            if "each" in text_lower or "pcs" in text_lower or "um" in text_lower:
-                                match = re.search(r'([\d,\.]+)\s+(?:each|pcs|um)\s+([\d,\.]+)', text_lower)
-                                if match:
-                                    qty = match.group(1)
-                                    unit = match.group(2)
-                                    # Get product description (everything before the qty)
-                                    desc_raw = text_lower.split(match.group(1))[0]
-                                    # Clean up description
-                                    desc = re.sub(r'^\d+[\.\s]+', '', desc_raw).strip().title()
-                                    if len(desc) > 30: desc = desc[:27] + "..."
-                                    if len(desc) == 0: desc = "Product"
-                                    extracted.append(("Line Item", f"{desc} | Qty: {qty} | Unit: ${unit}"))
+                            # 6. Generic Line Item matching (even if Tesseract dropped some numbers!)
+                            # E.g. "Description 10.00 5 50.00" or just "Description 50.00"
+                            if not extracted and y_norm > 250 and y_norm < 700:
+                                match_full = re.search(r'^(.+?)\s+([\d,\.]+)\s+([\d,\.]+)\s+([\d,\.]+)$', text)
+                                match_partial = re.search(r'^(.+?)\s+([\d,\.]+)$', text)
+                                
+                                if match_full:
+                                    desc = match_full.group(1).strip()
+                                    if not "total" in desc.lower() and not "subtotal" in desc.lower():
+                                        extracted.append(("Line Item", f"{desc} | {match_full.group(2)} | {match_full.group(3)} | {match_full.group(4)}"))
+                                elif match_partial:
+                                    desc = match_partial.group(1).strip()
+                                    # Ensure it's not just entity info by checking if it has a valid product-like description length
+                                    if len(desc) > 5 and not "total" in desc.lower() and not "subtotal" in desc.lower() and not "discount" in desc.lower():
+                                        extracted.append(("Line Item", f"{desc} | {match_partial.group(2)}"))
+                                else:
+                                    # Fallback for previous format "3,00 each 11,63"
+                                    match = re.search(r'([\d,\.]+)\s+(?:each|pcs|um)\s+([\d,\.]+)', text_lower)
+                                    if match:
+                                        qty = match.group(1)
+                                        unit = match.group(2)
+                                        desc_raw = text_lower.split(match.group(1))[0]
+                                        desc = re.sub(r'^\d+[\.\s]+', '', desc_raw).strip().title()
+                                        if len(desc) > 30: desc = desc[:27] + "..."
+                                        if len(desc) == 0: desc = "Product"
+                                        extracted.append(("Line Item", f"{desc} | Qty: {qty} | Unit: ${unit}"))
                                     
                             return extracted
 
                         # Step 1: Gather all raw text regions (from PDF or Image)
                         raw_regions = []
+                        use_ocr = False
+                        
                         if file_type == "PDF":
                             for page_data in context.get("extracted_pages", []):
                                 for r in page_data["text_regions"]:
                                     if len(r["text"]) > 1:
                                         raw_regions.append(r)
+                                        
+                            # Fallback: If it's a scanned PDF with no text layer, OCR the rendered image instead!
+                            if len(raw_regions) == 0 and len(context.get("extracted_pages", [])) > 0:
+                                use_ocr = True
+                                file_path = context["extracted_pages"][0]["image_path"]
                         else:
-                            # Use Tesseract for images
+                            use_ocr = True
+                            
+                        if use_ocr:
+                            # Use Tesseract for images or scanned PDFs
                             pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
                             img = Image.open(file_path)
                             width, height = img.size
@@ -218,8 +239,8 @@ async def process_document_pipeline(document_id: str, file_path: str, file_type:
                             y_center = (r["normalized_bbox"][0] + r["normalized_bbox"][2]) / 2
                             placed = False
                             for row in rows:
-                                # If y_center is within 25 units (2.5% of page height), consider it same row
-                                if abs(row["y_center"] - y_center) < 25:
+                                # Increase threshold dramatically for weird PDFs where columns are disjointed
+                                if abs(row["y_center"] - y_center) < 40:
                                     row["items"].append(r)
                                     row["y_center"] = (row["y_center"] * (len(row["items"])-1) + y_center) / len(row["items"])
                                     placed = True
